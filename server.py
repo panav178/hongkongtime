@@ -46,23 +46,55 @@ def to_hk_date(date_str: str | None, offset_days: int | None) -> datetime:
 
 
 def pick_hours(payload: dict, target_date_hk: datetime):
-    data = payload.get("data", {})
+    data = payload.get("data", {}) or {}
     overrides = data.get("overrides", []) or []
     availability = data.get("availability", []) or []
+    tz = data.get("timeZone", "Asia/Hong_Kong")
     target_date_str = target_date_hk.strftime("%Y-%m-%d")
 
     # Date-specific override takes precedence
     for ov in overrides:
         if ov.get("date") == target_date_str:
-            return True, ov.get("startTime"), ov.get("endTime"), data.get("timeZone", "Asia/Hong_Kong")
+            start = ov.get("startTime")
+            end = ov.get("endTime")
+            is_open = bool(start and end)
+            return is_open, start, end, tz
 
     # Otherwise, use weekday block
     weekday_name = WEEKDAY_NUM_TO_NAME[target_date_hk.isoweekday()]
     for block in availability:
-        if weekday_name in (block.get("days") or []):
-            return True, block.get("startTime"), block.get("endTime"), data.get("timeZone", "Asia/Hong_Kong")
+        days = block.get("days") or []
+        if weekday_name in days:
+            start = block.get("startTime")
+            end = block.get("endTime")
+            is_open = bool(start and end)
+            return is_open, start, end, tz
 
-    return False, None, None, data.get("timeZone", "Asia/Hong_Kong")
+    return False, None, None, tz
+
+def make_hk_datetime(date_hk: datetime, hhmm: str | None) -> datetime | None:
+    if not hhmm:
+        return None
+    hh, mm = map(int, hhmm.split(":"))
+    return date_hk.replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+def compute_now_status(target_date_hk: datetime, start: str | None, end: str | None) -> tuple[bool | None, str]:
+    # Returns (openNow, status). openNow is None if target date != today.
+    now_hk = datetime.now(HK_TZ)
+    if target_date_hk.date() != now_hk.date():
+        return None, "not_today"
+
+    start_dt = make_hk_datetime(target_date_hk, start)
+    end_dt = make_hk_datetime(target_date_hk, end)
+    if not start_dt or not end_dt:
+        return False, "closed"
+
+    if now_hk < start_dt:
+        return False, "before_open"
+    if start_dt <= now_hk < end_dt:
+        return True, "open"
+    return False, "after_close"
+
 
 
 async def compute_open(schedule_id: str, date: str | None, offsetDays: int | None):
@@ -81,6 +113,12 @@ async def compute_open(schedule_id: str, date: str | None, offsetDays: int | Non
         payload = r.json()
 
     is_open, start, end, tz = pick_hours(payload, target_date_hk)
+
+    open_now, status = compute_now_status(target_date_hk, start, end)  # None if not today
+
+    start_iso = make_hk_datetime(target_date_hk, start).isoformat() if start else None
+    end_iso = make_hk_datetime(target_date_hk, end).isoformat() if end else None
+
     return {
         "date": target_date_hk.strftime("%Y-%m-%d"),
         "weekday": WEEKDAY_NUM_TO_NAME[target_date_hk.isoweekday()],
@@ -88,6 +126,10 @@ async def compute_open(schedule_id: str, date: str | None, offsetDays: int | Non
         "open": is_open,
         "start": start,
         "end": end,
+        "startIso": start_iso,
+        "endIso": end_iso,
+        "openNow": open_now,   # true/false for today; null for other dates
+        "status": status,      # "before_open" | "open" | "after_close" | "closed" | "not_today"
     }
 
 
